@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Music Discovery Player</title>
+<style>
+  body { font-family: Arial, sans-serif; background: #f5f5f5; color: #222;
+    max-width: 800px; padding: 20px; margin: auto; line-height: 1.5; }
+  textarea, input:not([type="checkbox"]) { width: 100%; padding: 12px;
+    box-sizing: border-box; margin: 7px 0; font-size: 16px; }
+  button { padding: 12px 16px; margin: 6px 4px 6px 0; font-size: 15px;
+    border-radius: 6px; border: 1px solid #aaa; cursor: pointer; }
+  button:hover:not(:disabled) { background: #ddd; }
+  button:disabled { cursor: not-allowed; opacity: .55; }
+  small, .note { color: #555; }
+  label { display: block; font-weight: bold; }
+  #status { font-weight: bold; overflow-wrap: anywhere; }
+  #player { margin-top: 15px; min-height: 240px; }
+  #player iframe { max-width: 100%; }
+  #spotifyStatus, #videoTitle, #recommendationText { overflow-wrap: anywhere; }
+  #counter { font-weight: bold; margin-top: 14px; }
+  #recommendationText { margin-top: 4px; }
+  details { padding: 12px; border: 1px solid #ddd; border-radius: 6px;
+    background: white; margin: 14px 0; }
+  summary { cursor: pointer; font-weight: bold; }
+  .hint { font-size: 14px; }
+  @media (max-width: 460px) { button { padding: 10px 12px; } }
+</style>
+</head>
+<body>
+<h1>AI Music Discovery Player</h1>
+<p>Describe the music you're looking for. AI recommends titles and artists; the player finds recordings on YouTube or Spotify as you move through the recommendations.</p>
+
+<h3>AI Discovery Instructions</h3>
+<label for="instructions" class="hint">Your music search prompt</label>
+<textarea id="instructions" rows="6" placeholder="For example: Cross-reference consistency and confidence with winter holiday music from around the world."></textarea>
+
+<details>
+  <summary>Connection setup</summary>
+  <p class="hint">These are connections, not extra music instructions. The Cloudflare Worker must be secured and deployed before using AI Discovery.</p>
+  <label for="workerUrl">Cloudflare AI Worker URL</label>
+  <input id="workerUrl" type="url" placeholder="https://your-worker.your-account.workers.dev/" autocomplete="off">
+  <p class="hint">The Worker URL is not an API secret. Do not enter an OpenAI API key here. This page sends the prompt to your Worker only when you press Start Discovery.</p>
+  <label for="apiKey">YouTube API Key</label>
+  <input id="apiKey" type="password" autocomplete="off" placeholder="Your restricted YouTube Data API key">
+  <p class="hint">Your YouTube key stays in this browser tab and is sent to Google for YouTube searches. Each YouTube search uses API quota.</p>
+</details>
+
+<button id="spotifyLogin" type="button">Connect Spotify Premium</button>
+<p id="spotifyStatus" aria-live="polite">Spotify not connected.</p>
+
+<div>
+  <button id="startButton" type="button">Start Discovery</button>
+  <button id="previousButton" type="button" disabled>Previous</button>
+  <button id="nextButton" type="button" disabled>Next</button>
+  <button id="stopButton" type="button" disabled>Stop</button>
+</div>
+
+<h3>Now Playing</h3>
+<p id="counter" aria-live="polite">No recommendations yet.</p>
+<p id="recommendationText"></p>
+<p id="status" aria-live="polite">Ready.</p>
+<p id="videoTitle"></p>
+<div id="player"></div>
+<p class="hint">One AI request is made per Start Discovery. Next searches only the recommendation you've reached, not the whole list. Previous and Next replay previously found recordings without searching again. Nothing advances automatically.</p>
+
+<script>
+"use strict";
+// FRONTEND ONLY. The Cloudflare AI Worker must validate input and enforce
+// its own authentication / abuse limits. Origin/CORS checks alone are not security.
+const $ = id => document.getElementById(id);
+const instructionsInput = $("instructions");
+const workerUrlInput = $("workerUrl");
+const apiKeyInput = $("apiKey");
+const spotifyStatus = $("spotifyStatus");
+const statusText = $("status");
+const counterText = $("counter");
+const recommendationText = $("recommendationText");
+const titleText = $("videoTitle");
+const previousButton = $("previousButton");
+const nextButton = $("nextButton");
+const stopButton = $("stopButton");
+const startButton = $("startButton");
+
+// Spotify client ID is public, not a client secret. Register this NEW
+// redirect URI in the Spotify Developer Dashboard before using Spotify.
+const spotifyClientId = "57ba085f8fe8486aa6c7167eb6207d72";
+const spotifyRedirect =
+  "https://alexanderbconley-blip.github.io/ai-music-discovery-player/";
+
+let recommendations = []; // {title, artist, checked, recording, message}
+let currentIndex = -1;
+let requestNumber = 0;
+let currentController = null;
+let stopped = true;
+let aiLoading = false;
+let spotifyActivationFromStart = null;
+
+let youtubePlayer = null;
+let youtubeReady = false;
+let pendingYouTube = null;
+let spotifyPlayer = null;
+let spotifyDeviceId = null;
+let spotifyDevicePromise = null;
+let spotifyTransferred = false;
+let spotifySdkReady = false;
+let refreshPromise = null;
+
+function hasSpotify() { return !!sessionStorage.getItem("spotify_access_token"); }
+function hasYouTube() { return !!apiKeyInput.value.trim(); }
+function isCurrent(id) { return id === requestNumber && !stopped; }
+function newRequest() {
+  requestNumber++;
+  if (currentController) currentController.abort();
+  currentController = new AbortController();
+  return requestNumber;
+}
+function updateButtons() {
+  const active = recommendations.length > 0 && currentIndex >= 0;
+  previousButton.disabled = !active || currentIndex === 0;
+  nextButton.disabled = !active || currentIndex >= recommendations.length - 1;
+  stopButton.disabled = !active && !aiLoading;
+}
+function updateDisplay() {
+  if (currentIndex < 0 || !recommendations.length) {
+    counterText.textContent = "No recommendations yet.";
+    recommendationText.textContent = "";
+  } else {
+    const item = recommendations[currentIndex];
+    counterText.textContent = "Recommendation " + (currentIndex + 1) +
+      " of " + recommendations.length;
+    recommendationText.textContent = item.title + " — " + item.artist;
+  }
+  updateButtons();
+}
+function stopYouTube() {
+  pendingYouTube = null;
+  if (youtubeReady && youtubePlayer) {
+    try { youtubePlayer.stopVideo(); } catch (_) {}
+  }
+}
+async function pauseSpotify() {
+  if (spotifyPlayer) {
+    try { await spotifyPlayer.pause(); }
+    catch (e) { console.warn("Spotify pause:", e); }
+  }
+}
+function stopAudio() {
+  stopYouTube();
+  return pauseSpotify();
+}
+
+// A single embedded YouTube player is reused for all previously found IDs.
+window.onYouTubeIframeAPIReady = function () {
+  youtubePlayer = new YT.Player("player", {
+    width: "100%", height: "360",
+    playerVars: {
+      autoplay: 1, playsinline: 1,
+      ...(window.location.protocol === "https:"
+        ? {origin: window.location.origin} : {})
+    },
+    events: {
+      onReady() {
+        youtubeReady = true;
+        youtubePlayer.getIframe().setAttribute("allow",
+          "autoplay; encrypted-media; fullscreen; picture-in-picture");
+        if (pendingYouTube) playYouTube(pendingYouTube);
+      },
+      onStateChange(event) {
+        if (event.data === YT.PlayerState.PLAYING && !stopped)
+          statusText.textContent = "Playing on YouTube.";
+      },
+      onAutoplayBlocked() {
+        statusText.textContent = "Your browser blocked autoplay. Press Play in the video.";
+      },
+      onError(event) {
+        if (!stopped)
+          statusText.textContent = "This YouTube video cannot play here (error " +
+            event.data + "). You can try Next.";
+      }
+    }
+  });
+};
+const ytScript = document.createElement("script");
+ytScript.src = "https://www.youtube.com/iframe_api";
+document.head.appendChild(ytScript);
+function playYouTube(video) {
+  pendingYouTube = video;
+  titleText.textContent = video.title;
+  if (!youtubeReady || !youtubePlayer) {
+    statusText.textContent = "Waiting for YouTube player...";
+    return;
+  }
+  statusText.textContent = "Starting YouTube...";
+  youtubePlayer.loadVideoById(video.id);
+  youtubePlayer.unMute();
+  youtubePlayer.playVideo();
+}
+
+// We match the recommended title AND artist; we do not randomly select
+// unrelated YouTube videos from a broad keyword result list.
+function normalizeName(name) {
+  return String(name || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+function titleMatch(actual, wanted) {
+  const a = normalizeName(actual), w = normalizeName(wanted);
+  if (!a || !w) return false;
+  if (a === w || a.includes(w)) return true;
+  const words = w.split(" ").filter(x => x.length > 2);
+  return words.length > 0 && words.filter(x => a.split(" ").includes(x)).length /
+    words.length >= .85;
+}
+function artistMatch(actual, wanted) {
+  const a = normalizeName(actual), w = normalizeName(wanted);
+  if (!a || !w) return false;
+  if (a.includes(w)) return true;
+  const words = w.split(" ").filter(x => x.length > 2);
+  return words.length > 0 && words.every(x => a.split(" ").includes(x));
+}
+async function searchYouTube(item, signal) {
+  const key = apiKeyInput.value.trim();
+  if (!key) return null;
+  const params = new URLSearchParams({
+    part: "snippet", type: "video", videoEmbeddable: "true",
+    maxResults: "10", q: item.title + " " + item.artist, key
+  });
+  const response = await fetch("https://www.googleapis.com/youtube/v3/search?" + params,
+    {signal});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.message || "YouTube search failed");
+  const videos = (data.items || []).filter(v => v.id?.videoId);
+  const valid = videos.find(v =>
+    titleMatch(v.snippet?.title, item.title) &&
+    artistMatch((v.snippet?.title || "") + " " + (v.snippet?.channelTitle || ""), item.artist));
+  return valid ? {
+    platform: "youtube", id: valid.id.videoId,
+    title: valid.snippet?.title || item.title + " — " + item.artist
+  } : null;
+}
+
+function base64url(bytes) {
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-")
+    .replace(/\//g, "_").replace(/=+$/, "");
+}
+function saveBeforeSpotifyRedirect() {
+  // Keep the prompt (not API keys) while Spotify sends us to its sign-in page.
+  sessionStorage.setItem("ai_music_prompt", instructionsInput.value);
+  sessionStorage.setItem("ai_music_worker", workerUrlInput.value);
+}
+function restoreAfterSpotifyRedirect() {
+  const prompt = sessionStorage.getItem("ai_music_prompt");
+  const url = sessionStorage.getItem("ai_music_worker");
+  if (prompt !== null) instructionsInput.value = prompt;
+  if (url !== null) workerUrlInput.value = url;
+}
+restoreAfterSpotifyRedirect();
+
+async function connectSpotify() {
+  saveBeforeSpotifyRedirect();
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(64)));
+  const digest = await crypto.subtle.digest("SHA-256",
+    new TextEncoder().encode(verifier));
+  const state = base64url(crypto.getRandomValues(new Uint8Array(16)));
+  sessionStorage.setItem("spotify_verifier", verifier);
+  sessionStorage.setItem("spotify_state", state);
+  const params = new URLSearchParams({
+    client_id: spotifyClientId, response_type: "code",
+    redirect_uri: spotifyRedirect, code_challenge_method: "S256",
+    code_challenge: base64url(new Uint8Array(digest)), state,
+    scope: ["streaming", "user-read-private", "user-read-email",
+      "user-read-playback-state", "user-modify-playback-state"].join(" ")
+  });
+  window.location.href = "https://accounts.spotify.com/authorize?" + params;
+}
+$("spotifyLogin").addEventListener("click", () => {
+  connectSpotify().catch(e => {
+    spotifyStatus.textContent = "Could not start Spotify login: " + e.message;
+  });
+});
+function storeTokens(data) {
+  sessionStorage.setItem("spotify_access_token", data.access_token);
+  sessionStorage.setItem("spotify_expires_at", String(Date.now() +
+    data.expires_in * 1000));
+  if (data.refresh_token)
+    sessionStorage.setItem("spotify_refresh_token", data.refresh_token);
+}
+async function exchangeSpotifyCode(code, verifier) {
+  const response = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
+    body: new URLSearchParams({client_id: spotifyClientId,
+      grant_type: "authorization_code", code,
+      redirect_uri: spotifyRedirect, code_verifier: verifier})
+  });
+  const data = await response.json();
+  if (!response.ok)
+    throw new Error(data.error_description || data.error || "Spotify login failed");
+  storeTokens(data);
+}
+async function spotifyCallback() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get("code"), error = params.get("error");
+  if (!code && !error) return;
+  if (error) {
+    spotifyStatus.textContent = "Spotify authorization: " + error;
+    return;
+  }
+  const state = sessionStorage.getItem("spotify_state");
+  const verifier = sessionStorage.getItem("spotify_verifier");
+  if (!state || !verifier || params.get("state") !== state) {
+    spotifyStatus.textContent = "Spotify security check failed. Reconnect.";
+    return;
+  }
+  try {
+    await exchangeSpotifyCode(code, verifier);
+    spotifyStatus.textContent = "Spotify Premium connected for this tab.";
+    window.history.replaceState({}, "", spotifyRedirect);
+  } catch (e) {
+    spotifyStatus.textContent = "Spotify login failed: " + e.message;
+  } finally {
+    sessionStorage.removeItem("spotify_state");
+    sessionStorage.removeItem("spotify_verifier");
+  }
+}
+spotifyCallback().catch(e => {
+  spotifyStatus.textContent = "Spotify connection error: " + e.message;
+});
+if (hasSpotify()) spotifyStatus.textContent = "Spotify connected for this browser tab.";
+window.onSpotifyWebPlaybackSDKReady = () => { spotifySdkReady = true; };
+const spScript = document.createElement("script");
+spScript.src = "https://sdk.scdn.co/spotify-player.js";
+document.head.appendChild(spScript);
+
+async function spotifyToken() {
+  const token = sessionStorage.getItem("spotify_access_token");
+  if (!token) throw new Error("Connect Spotify Premium first.");
+  const expiry = Number(sessionStorage.getItem("spotify_expires_at") || 0);
+  if (expiry && Date.now() < expiry - 60000) return token;
+  const refreshToken = sessionStorage.getItem("spotify_refresh_token");
+  if (!refreshToken) throw new Error("Spotify session expired. Reconnect.");
+  if (!refreshPromise) {
+    refreshPromise = (async () => {
+      const response = await fetch("https://accounts.spotify.com/api/token", {
+        method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
+        body: new URLSearchParams({grant_type: "refresh_token",
+          refresh_token: refreshToken, client_id: spotifyClientId})
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error("Spotify session expired. Reconnect.");
+      storeTokens(data);
+      return data.access_token;
+    })().finally(() => { refreshPromise = null; });
+  }
+  return refreshPromise;
+}
+async function spotifyRequest(path, token, options = {}) {
+  const response = await fetch("https://api.spotify.com/v1/" + path, {
+    ...options, headers: {Authorization: "Bearer " + token,
+      ...(options.headers || {})}
+  });
+  if (!response.ok) {
+    let message = "Spotify HTTP " + response.status;
+    try {
+      const data = await response.json();
+      message += ": " + (data.error?.message || JSON.stringify(data));
+    } catch (_) {}
+    throw new Error(message);
+  }
+  return response;
+}
+// Activate Spotify playback inside the actual Start/Next/Previous click.
+async function prepareSpotifyPlayer() {
+  if (!spotifySdkReady || !window.Spotify)
+    throw new Error("Spotify player is still loading; try again shortly.");
+  if (!spotifyPlayer) {
+    spotifyPlayer = new Spotify.Player({
+      name: "AI Music Discovery Player",
+      getOAuthToken: cb => spotifyToken().then(cb).catch(e => {
+        spotifyStatus.textContent = e.message;
+        cb("");
+      }), volume: .7
+    });
+    spotifyDevicePromise = new Promise((resolve, reject) => {
+      spotifyPlayer.addListener("ready", ({device_id}) => {
+        spotifyDeviceId = device_id;
+        resolve(device_id);
+      });
+      spotifyPlayer.addListener("not_ready", ({device_id}) => {
+        if (spotifyDeviceId === device_id) {
+          spotifyDeviceId = null;
+          spotifyTransferred = false;
+        }
+      });
+      spotifyPlayer.addListener("autoplay_failed", () => {
+        statusText.textContent = "Spotify playback was blocked. Try Next or reconnect Spotify.";
+      });
+      for (const e of ["initialization_error", "authentication_error", "account_error"])
+        spotifyPlayer.addListener(e, ({message}) => reject(new Error(message)));
+      spotifyPlayer.connect().then(ok => {
+        if (!ok) reject(new Error("Spotify player could not connect."));
+      }).catch(reject);
+    });
+  }
+  spotifyPlayer.activateElement();
+  return spotifyDeviceId || await spotifyDevicePromise;
+}
+async function searchSpotify(item, signal) {
+  const token = await spotifyToken();
+  const params = new URLSearchParams({
+    q: item.title + " " + item.artist, type: "track", limit: "20"
+  });
+  const response = await spotifyRequest("search?" + params, token, {signal});
+  const data = await response.json();
+  const track = (data.tracks?.items || []).find(t =>
+    t?.id && t.uri && titleMatch(t.name, item.title) &&
+    (t.artists || []).some(a => artistMatch(a.name, item.artist)));
+  return track ? {
+    platform: "spotify", id: track.id, uri: track.uri,
+    title: track.name + " — " + track.artists.map(a => a.name).join(", ")
+  } : null;
+}
+async function playSpotify(recording, id, signal, devicePromise) {
+  const deviceId = await (devicePromise || prepareSpotifyPlayer());
+  if (!deviceId) throw new Error("Spotify playback device unavailable. Try again.");
+  if (!isCurrent(id)) return;
+  const token = await spotifyToken();
+  if (!isCurrent(id)) return;
+  if (!spotifyTransferred) {
+    await spotifyRequest("me/player", token, {
+      method: "PUT", signal,
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({device_ids: [deviceId], play: false})
+    });
+    if (!isCurrent(id)) return;
+    spotifyTransferred = true;
+  }
+  await spotifyRequest("me/player/play?device_id=" +
+    encodeURIComponent(deviceId), token, {
+    method: "PUT", signal,
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({uris: [recording.uri]})
+  });
+  if (!isCurrent(id)) { await pauseSpotify(); return; }
+  titleText.textContent = recording.title;
+  statusText.textContent = "Spotify playback requested.";
+}
+
+function cleanRecommendations(payload) {
+  // Accept only structured title/artist values; never search field labels.
+  const list = Array.isArray(payload) ? payload : payload?.songs;
+  if (!Array.isArray(list)) throw new Error("Worker did not return a songs array.");
+  const seen = new Set();
+  return list.filter(item => item && typeof item.title === "string" &&
+      typeof item.artist === "string" && item.title.trim() && item.artist.trim())
+    .map(item => ({title: item.title.trim(), artist: item.artist.trim(),
+      checked: false, recording: null, message: ""}))
+    .filter(item => {
+      const key = normalizeName(item.title) + "|" + normalizeName(item.artist);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+// The current index is the recommendation number, regardless of whether
+// a matching recording exists; no silent skipping or background searches.
+async function goTo(index) {
+  if (index < 0 || index >= recommendations.length) return;
+  const id = newRequest();
+  stopped = false;
+  const signal = currentController.signal;
+  currentIndex = index;
+  updateDisplay();
+  titleText.textContent = "";
+  stopYouTube();
+  const oldPause = pauseSpotify();
+  const item = recommendations[index];
+
+  if (item.checked && !item.recording) {
+    statusText.textContent = item.message || "No matching recording found.";
+    return;
+  }
+
+  // Activate Spotify before awaiting any network calls, when a click permits it.
+  let devicePromise = null;
+  if (hasSpotify() && spotifySdkReady) {
+    // Do this immediately on Next/Previous clicks, before waiting for search.
+    // An initial activation from Start Discovery may already be available.
+    devicePromise = spotifyActivationFromStart ||
+      prepareSpotifyPlayer().catch(e => {
+        console.warn("Spotify player not ready:", e);
+        return null;
+      });
+    spotifyActivationFromStart = null;
+  }
+  try {
+    await oldPause;
+    if (!isCurrent(id)) return;
+    if (item.recording) {
+      statusText.textContent = "Replaying a previously found recording...";
+      if (item.recording.platform === "youtube") playYouTube(item.recording);
+      else await playSpotify(item.recording, id, signal, devicePromise);
+      return;
+    }
+    if (!hasSpotify() && !hasYouTube()) {
+      statusText.textContent = "Connect Spotify Premium or enter a YouTube API key first.";
+      return;
+    }
+    statusText.textContent = "Searching for: " + item.title + " — " + item.artist;
+    // Random is the starting platform, not a random recording.
+    const platforms = hasSpotify() && hasYouTube()
+      ? (Math.random() < .5 ? ["spotify", "youtube"] : ["youtube", "spotify"])
+      : (hasSpotify() ? ["spotify"] : ["youtube"]);
+    let recording = null, lastError = null;
+    for (const platform of platforms) {
+      if (!isCurrent(id)) return;
+      try {
+        recording = platform === "spotify"
+          ? await searchSpotify(item, signal)
+          : await searchYouTube(item, signal);
+      } catch (e) {
+        if (e.name === "AbortError" || !isCurrent(id)) return;
+        lastError = e;
+        console.warn(platform + " search failed:", e);
+      }
+      if (recording) break;
+    }
+    if (!isCurrent(id)) return;
+    if (!recording) {
+      // A provider API error is not the same as "recording not found".
+      if (lastError) {
+        statusText.textContent = "Search unavailable: " + lastError.message +
+          ". Try again later or check your connections.";
+        return;
+      }
+      item.checked = true;
+      item.message = "No matching recording found on connected platforms.";
+      statusText.textContent = item.message;
+      return;
+    }
+    statusText.textContent = "Recording found. Starting playback...";
+    if (recording.platform === "youtube") {
+      item.recording = recording;
+      item.checked = true;
+      playYouTube(recording);
+    } else {
+      // Spotify playback may fail if browser activation was unavailable.
+      // Keep the search result for a retry, without repeating the search.
+      item.recording = recording;
+      item.checked = true;
+      await playSpotify(recording, id, signal, devicePromise);
+    }
+  } catch (error) {
+    if (!isCurrent(id) || error.name === "AbortError") return;
+    statusText.textContent = "Playback error: " + error.message;
+  }
+}
+
+async function startDiscovery() {
+  const prompt = instructionsInput.value.trim();
+  const workerUrl = workerUrlInput.value.trim();
+  if (!prompt) { statusText.textContent = "Enter your AI music instructions first."; return; }
+  if (!workerUrl) { statusText.textContent = "Enter your secured Cloudflare Worker URL in Connection setup first."; return; }
+  let url;
+  try {
+    url = new URL(workerUrl);
+    if (url.protocol !== "https:") throw new Error("HTTPS is required");
+  } catch (_) {
+    statusText.textContent = "Enter a valid HTTPS Cloudflare Worker URL.";
+    return;
+  }
+  if (url.username || url.password) {
+    statusText.textContent = "Do not include credentials in the Worker URL.";
+    return;
+  }
+  if (prompt.length > 2000) {
+    statusText.textContent = "The current Worker supports prompts up to 2,000 characters.";
+    return;
+  }
+  const id = newRequest();
+  stopped = false;
+  aiLoading = true;
+  startButton.disabled = true;
+  updateButtons();
+  // Spotify must be unlocked during the user's Start click, not after the AI call.
+  if (hasSpotify() && spotifySdkReady) {
+    spotifyActivationFromStart = prepareSpotifyPlayer().catch(e => {
+      console.warn("Spotify could not activate:", e);
+      return null;
+    });
+  }
+  await stopAudio();
+  if (!isCurrent(id)) return;
+  recommendations = [];
+  currentIndex = -1;
+  updateDisplay();
+  titleText.textContent = "";
+  statusText.textContent = "Asking Cloudflare AI for recommendations...";
+  startButton.disabled = true;
+  previousButton.disabled = true;
+  nextButton.disabled = true;
+  stopButton.disabled = false;
+  try {
+    const response = await fetch(url.href, {
+      method: "POST", signal: currentController.signal,
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({prompt})
+    });
+    if (!response.ok) {
+      let reason = "Worker returned HTTP " + response.status;
+      try { reason = (await response.json()).error || reason; } catch (_) {}
+      throw new Error(reason);
+    }
+    const payload = await response.json();
+    if (!isCurrent(id)) return;
+    recommendations = cleanRecommendations(payload);
+    if (!recommendations.length)
+      throw new Error("AI returned no valid title-and-artist recommendations.");
+    statusText.textContent = "Received " + recommendations.length +
+      " recommendations. Searching the first one...";
+    // No second AI call is ever initiated by Next or Previous.
+    goTo(0);
+  } catch (e) {
+    if (!isCurrent(id) || e.name === "AbortError") return;
+    statusText.textContent = "AI request failed: " + e.message;
+  } finally {
+    aiLoading = false;
+    startButton.disabled = false;
+    updateButtons();
+  }
+}
+
+startButton.addEventListener("click", () => { startDiscovery().catch(console.error); });
+previousButton.addEventListener("click", () => { goTo(currentIndex - 1); });
+nextButton.addEventListener("click", () => { goTo(currentIndex + 1); });
+stopButton.addEventListener("click", () => {
+  newRequest();
+  stopped = true;
+  aiLoading = false;
+  spotifyActivationFromStart = null;
+  stopAudio();
+  statusText.textContent = "Stopped. Your recommendation list remains available.";
+  updateButtons();
+});
+updateButtons();
+</script>
+</body>
+</html>
