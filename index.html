@@ -29,6 +29,18 @@
     justify-content: center; gap: 12px; background: #111; color: #ddd;
     pointer-events: none; text-align: center; padding: 16px; box-sizing: border-box; }
   #youtubePlaceholder[hidden] { display: none; }
+  #youtubeFallback { position: absolute; inset: 0; z-index: 2;
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 13px; padding: 18px; box-sizing: border-box;
+    text-align: center; background: #111; color: #f5f5f5; }
+  #youtubeFallback[hidden] { display: none; }
+  #youtubeFallback p { margin: 0; }
+  #watchOnYouTube { display: inline-block; padding: 10px 14px;
+    background: #fafafa; color: #151515; border-radius: 5px;
+    font-weight: 600; text-decoration: none; }
+  #watchOnYouTube:hover, #watchOnYouTube:focus-visible {
+    background: #e2e2e2; text-decoration: underline; }
+  #youtubeFallback small { color: #cfcfcf; }
 
   #promptList { display: grid; gap: 14px; margin: 12px 0; }
   .prompt-card { background: white; padding: 14px; border: 1px solid #bbb;
@@ -105,6 +117,14 @@
     font-size: 17px; font-weight: 600; }
   .recommendation-list .reco-subtle { display: block; font-size: 12px;
     color: #62676c; margin-top: 3px; }
+  /* Recommendation text must remain selectable even though its row can be clicked.
+     The two source views (prompt card and player) share this styling. */
+  .recommendation-trigger, .recommendation-row,
+  .recommendation-trigger .reco-text, .recommendation-row .reco-main {
+    -webkit-user-select: text; user-select: text;
+  }
+  .recommendation-row:focus-visible { outline: 3px solid #2465a8;
+    outline-offset: -3px; }
   .prompt-foot { align-items: flex-end; }
   .prompt-progress-wrap { flex: 1; min-width: 0; }
   .prompt-card .recommendation-trigger { margin: 0 0 6px; }
@@ -132,7 +152,7 @@
 <p>Describe the music you're looking for. AI recommends titles and artists; the player finds recordings on YouTube or Spotify as you move through the recommendations.</p>
 
 <h3>AI Discovery Prompts</h3>
-<p class="hint">Add as many prompts as you wish. Each prompt keeps its own recommendations and playback history. Select Explore to begin or return to a prompt.</p>
+<p class="hint">Add as many prompts as you wish. Each prompt keeps its own recommendations and playback history. Select Explore to begin or return to a prompt. Expand a recommendation list to select a song, or drag over its title and artist to highlight and copy that one recommendation.</p>
 <div id="promptList" aria-label="AI discovery prompts"></div>
 <button id="addPrompt" type="button">+ Add Prompt</button>
 <p id="storageWarning" class="hint" role="status"></p>
@@ -193,9 +213,14 @@
 <div id="youtubeFrame" aria-label="YouTube player area">
   <div id="player"></div>
   <div id="youtubePlaceholder" role="status">No YouTube video playing</div>
+  <div id="youtubeFallback" hidden role="status">
+    <p>This video cannot play inside the player.</p>
+    <a id="watchOnYouTube" target="_blank" rel="noopener noreferrer">Watch on YouTube</a>
+    <small>Opening the recording on YouTube adds its gray checkmark.</small>
+  </div>
 </div>
 <p id="status" aria-live="polite"></p>
-<p class="hint">AI generates each prompt's recommendation list once. Selecting a recommendation searches for that recording when first reached, or replays a previously found recording without searching again. When a recording finishes, the player advances to the next recommendation or the next unexplored prompt. Previous, Next, and Stop also work manually. A gray checkmark means playback has started previously.</p>
+<p class="hint">AI generates each prompt's recommendation list once. Selecting a recommendation searches for that recording when first reached, or replays a previously found recording without searching again. When a recording finishes, the player advances to the next recommendation or the next unexplored prompt. Previous, Next, and Stop also work manually. A gray checkmark means playback started here or you opened the recording directly on YouTube to listen.</p>
 
 <script>
 "use strict";
@@ -213,6 +238,8 @@ const statusText = $("status");
 const playerRecommendations = $("playerRecommendations");
 const spotifyPlaybackStatus = $("spotifyPlaybackStatus");
 const youtubePlaceholder = $("youtubePlaceholder");
+const youtubeFallback = $("youtubeFallback");
+const watchOnYouTube = $("watchOnYouTube");
 const previousButton = $("previousButton");
 const nextButton = $("nextButton");
 const stopButton = $("stopButton");
@@ -354,16 +381,31 @@ function recommendationLabel(item) {
   // Preserve the AI's specific recording title, remix and credited artists.
   return item.title + " — " + item.artist;
 }
+// Selecting text should NOT also start playback or collapse a recommendation list.
+function textSelectedWithin(element) {
+  const selection = window.getSelection();
+  return !!selection && !selection.isCollapsed && !!selection.toString().trim() &&
+    (element.contains(selection.anchorNode) || element.contains(selection.focusNode));
+}
+function keyboardActivate(event, handler) {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    handler();
+  }
+}
 function makeRecommendationPanel(session, location) {
   const expanded = location === "player" ? playerListOpen : openPromptLists.has(session.id);
   const current = session.recommendations[session.index];
   const container = document.createElement("div");
   container.className = "recommendation-panel";
-  const trigger = document.createElement("button");
+  // A div with keyboard activation allows actual text selection; a native
+  // button prevented users from highlighting the recommendation label.
+  const trigger = document.createElement("div");
   trigger.className = "recommendation-trigger";
-  trigger.type = "button";
+  trigger.tabIndex = 0;
+  trigger.setAttribute("role", "button");
   trigger.setAttribute("aria-expanded", String(expanded));
-  trigger.setAttribute("aria-label", "Show recommendations for this prompt");
+  trigger.setAttribute("aria-label", "Toggle recommendations for this prompt");
   const content = document.createElement("span");
   content.className = "reco-text";
   const number = document.createElement("span");
@@ -378,7 +420,7 @@ function makeRecommendationPanel(session, location) {
   chevron.setAttribute("aria-hidden", "true");
   content.append(number, title);
   trigger.append(content, chevron);
-  trigger.addEventListener("click", () => {
+  function toggleList() {
     if (location === "player") {
       playerListOpen = !playerListOpen;
       renderPlayerRecommendations();
@@ -387,7 +429,11 @@ function makeRecommendationPanel(session, location) {
       else openPromptLists.add(session.id);
       renderPromptList();
     }
+  }
+  trigger.addEventListener("click", () => {
+    if (!textSelectedWithin(trigger)) toggleList();
   });
+  trigger.addEventListener("keydown", event => keyboardActivate(event, toggleList));
   container.append(trigger);
   if (!expanded) return container;
   const list = document.createElement("div");
@@ -395,10 +441,12 @@ function makeRecommendationPanel(session, location) {
   list.setAttribute("role", "group");
   list.setAttribute("aria-label", "All AI recommendations");
   session.recommendations.forEach((item, i) => {
-    const row = document.createElement("button");
+    const row = document.createElement("div");
     row.className = "recommendation-row" + (i === session.index ? " selected" : "");
-    row.type = "button";
-    row.title = "Select and play this recommendation";
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
+    row.setAttribute("aria-label", "Select and play recommendation " + (i + 1) + ": " + recommendationLabel(item));
+    row.title = "Click to play; or select the text to copy it";
     const main = document.createElement("span"); main.className = "reco-main";
     const line = document.createElement("span");
     line.textContent = (i + 1) + " of " + session.recommendations.length + " — " + recommendationLabel(item);
@@ -406,11 +454,13 @@ function makeRecommendationPanel(session, location) {
     const check = document.createElement("span");
     check.className = "played-mark";
     check.textContent = item.played ? "✓" : "";
-    check.setAttribute("aria-label", item.played ? "Previously played" : "Not yet played");
+    check.setAttribute("aria-label", item.played ? "Previously played here or opened on YouTube" : "Not yet explored");
     row.append(main, check);
+    const playSelected = () => { selectRecommendation(session.id, i).catch(console.error); };
     row.addEventListener("click", () => {
-      selectRecommendation(session.id, i).catch(console.error);
+      if (!textSelectedWithin(row)) playSelected();
     });
+    row.addEventListener("keydown", event => keyboardActivate(event, playSelected));
     list.append(row);
   });
   container.append(list);
@@ -607,6 +657,8 @@ function updateDisplay() {
 }
 function stopYouTube() {
   youtubePlaceholder.hidden = false;
+  youtubeFallback.hidden = true;
+  watchOnYouTube.removeAttribute("href");
   pendingYouTube = null;
   youtubePlaybackId = null;
   if (youtubeReady && youtubePlayer) {
@@ -632,6 +684,24 @@ function stopAudio() {
   return pauseSpotify();
 }
 
+// We cannot detect clicking YouTube's own iframe controls. This direct link
+// is ours, so clicking it can mark the recommendation as explored.
+watchOnYouTube.addEventListener("click", event => {
+  const current = activeSession();
+  const recording = current?.recommendations[current.index]?.recording;
+  if (stopped || !recording || recording.platform !== "youtube" ||
+      !pendingYouTube || recording.id !== pendingYouTube.id ||
+      youtubePlaybackId !== requestNumber ||
+      watchOnYouTube.href !== "https://www.youtube.com/watch?v=" + encodeURIComponent(recording.id)) {
+    event.preventDefault();
+    return;
+  }
+  // This means the user chose to open the recording, NOT that external
+  // YouTube playback was independently confirmed.
+  markCurrentPlayed("youtube", recording.id);
+  statusText.textContent = "Opened on YouTube to listen. External playback cannot be verified; press Next here when ready.";
+});
+
 // A single embedded YouTube player is reused for all previously found IDs.
 window.onYouTubeIframeAPIReady = function () {
   youtubePlayer = new YT.Player("player", {
@@ -651,6 +721,7 @@ window.onYouTubeIframeAPIReady = function () {
       onStateChange(event) {
         if (stopped || !pendingYouTube || youtubePlaybackId !== requestNumber) return;
         if (event.data === YT.PlayerState.PLAYING) {
+          youtubeFallback.hidden = true;
           markCurrentPlayed("youtube", pendingYouTube.id);
           statusText.textContent = "Playing on YouTube.";
         } else if (event.data === YT.PlayerState.ENDED) {
@@ -661,9 +732,15 @@ window.onYouTubeIframeAPIReady = function () {
         statusText.textContent = "Your browser blocked autoplay. Press Play in the video.";
       },
       onError(event) {
-        if (!stopped)
-          statusText.textContent = "This YouTube video cannot play here (error " +
-            event.data + "). You can try Next.";
+        if (stopped || !pendingYouTube || youtubePlaybackId !== requestNumber) return;
+        const recording = activeSession()?.recommendations[activeSession()?.index]?.recording;
+        if (!recording || recording.platform !== "youtube" ||
+            recording.id !== pendingYouTube.id) return;
+        youtubeFallback.hidden = false;
+        youtubePlaceholder.hidden = true;
+        watchOnYouTube.href = "https://www.youtube.com/watch?v=" + encodeURIComponent(recording.id);
+        statusText.textContent = "YouTube playback unavailable in this player (error " +
+          event.data + "). Choose Watch on YouTube or press Next.";
       }
     }
   });
@@ -674,6 +751,8 @@ document.head.appendChild(ytScript);
 function playYouTube(video) {
   pendingYouTube = video;
   youtubePlaybackId = requestNumber;
+  youtubeFallback.hidden = true;
+  watchOnYouTube.removeAttribute("href");
   youtubePlaceholder.hidden = true;
   if (!youtubeReady || !youtubePlayer) {
     statusText.textContent = "Waiting for YouTube player...";
