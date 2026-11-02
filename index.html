@@ -56,8 +56,29 @@
   .delete-confirmation-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
   .delete-confirmation .confirm-delete { background: #a22; color: white; border-color: #a22; }
   .delete-confirmation .confirm-delete:hover { background: #811; }
-  .prompt-foot .delete-button { margin-left: auto; }
-  .prompt-head, .prompt-foot { justify-content: space-between; }
+  .prompt-head { justify-content: space-between; }
+  /* Recommendation occupies a separate, full-width row. Playback and Delete
+     share only the row BELOW it, so long titles cannot overlap controls. */
+  .prompt-results { width: 100%; min-width: 0; margin-top: 6px; }
+  .prompt-action-row { display: flex; align-items: center;
+    justify-content: space-between; flex-wrap: wrap; gap: 8px 12px;
+    margin-top: 8px; min-width: 0; }
+  .prompt-playback { display: flex; align-items: center;
+    flex-wrap: wrap; gap: 5px; }
+  .prompt-card .prompt-playback button, .prompt-card .delete-button {
+    width: 36px; height: 34px; min-width: 36px;
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 5px; border-radius: 6px; }
+  .prompt-card button svg { height: 18px; width: 18px; flex: none;
+    stroke: currentColor; stroke-width: 2; stroke-linecap: round;
+    stroke-linejoin: round; fill: none; }
+  .prompt-card .delete-button { margin-left: auto; }
+  .prompt-card .prompt-playback button:disabled { opacity: .42; }
+  .prompt-card .prompt-playback button[aria-pressed="true"] {
+    background: #e4edf7; border-color: #9bb7d5; }
+  .prompt-card .recommendation-panel { min-width: 0; width: 100%; }
+  .prompt-card .recommendation-trigger { box-sizing: border-box;
+    width: 100%; min-width: 0; }
   .prompt-head label { font-weight: bold; }
   .prompt-card textarea { min-height: 90px; resize: vertical; }
   .prompt-card textarea[readonly] { background: #ededed; color: #444;
@@ -125,9 +146,7 @@
   }
   .recommendation-row:focus-visible { outline: 3px solid #2465a8;
     outline-offset: -3px; }
-  .prompt-foot { align-items: flex-end; }
-  .prompt-progress-wrap { flex: 1; min-width: 0; }
-  .prompt-card .recommendation-trigger { margin: 0 0 6px; }
+  .prompt-card .recommendation-trigger { margin: 0; }
   #playerRecommendations .recommendation-list { max-height: 270px; }
   #playerRecommendations { margin: 10px 0 12px; }
   .backup-actions { display: flex; gap: 10px; flex-wrap: wrap; }
@@ -263,6 +282,7 @@ let requestNumber = 0;
 let currentController = null;
 let stopped = true;
 let aiLoading = false;
+let playbackPaused = false; // Ephemeral UI state; never alters saved music history.
 let spotifyActivationFromStart = null;
 
 let youtubePlayer = null;
@@ -375,6 +395,30 @@ function iconButton(label, title, action, disabled = false) {
   button.setAttribute("aria-label", title);
   button.disabled = disabled;
   button.addEventListener("click", action);
+  return button;
+}
+// All icons are fixed SVG shapes, not inferred from song text.
+const CARD_ICONS = {
+  copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
+  previous: '<path d="M5 5v14M19 6l-10 6 10 6z"/>',
+  play: '<path d="m8 5 11 7-11 7z"/>',
+  pause: '<path d="M9 5v14M15 5v14"/>',
+  next: '<path d="M19 5v14M5 6l10 6-10 6z"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="1"/>',
+  trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>'
+};
+function svgIcon(name) {
+  return '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">' +
+    CARD_ICONS[name] + '</svg>';
+}
+function actionIcon(name, tooltip, handler) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "icon-button";
+  button.innerHTML = svgIcon(name);
+  button.title = tooltip;
+  button.setAttribute("aria-label", tooltip);
+  button.addEventListener("click", handler);
   return button;
 }
 function recommendationLabel(item) {
@@ -541,7 +585,7 @@ function renderPromptList() {
         if (index < promptSessions.length-1)
           movePrompt(p.id, promptSessions[index+1].id, true);
       }, index === promptSessions.length-1),
-      iconButton("Duplicate", "Duplicate prompt beneath this one", () => {
+      actionIcon("copy", "Duplicate prompt beneath this one", () => {
         const copy = addPrompt(p.text, true, p.id);
         const field = $("prompt-" + copy.id);
         if (field) field.focus();
@@ -561,26 +605,47 @@ function renderPromptList() {
     textarea.readOnly = p.explored || p.id === loadingPromptId;
     textarea.setAttribute("aria-readonly", String(textarea.readOnly));
     textarea.addEventListener("input", () => { p.text = textarea.value; saveHistory(); });
-    const foot = document.createElement("div"); foot.className = "prompt-foot";
-    const progress = document.createElement("div"); progress.className = "prompt-progress-wrap";
-    if (p.explored) progress.append(makeRecommendationPanel(p, "card"));
+    const results = document.createElement("div");
+    results.className = "prompt-results";
+    if (p.explored) results.append(makeRecommendationPanel(p, "card"));
     else {
       const text = document.createElement("span"); text.className = "prompt-progress";
       text.textContent = p.id === loadingPromptId
         ? "Generating recommendations..." : "Not explored yet";
-      progress.append(text);
+      results.append(text);
     }
-    const deletion = document.createElement("button");
-    deletion.type = "button";
-    deletion.className = "delete-button";
-    deletion.textContent = "Delete";
-    deletion.setAttribute("aria-label", "Delete prompt and its recommendation history");
-    deletion.addEventListener("click", () => {
+    const actionRow = document.createElement("div");
+    actionRow.className = "prompt-action-row";
+    const playback = document.createElement("div");
+    playback.className = "prompt-playback";
+    if (p.explored) {
+      for (const [name, tooltip, handler] of [
+        ["previous", "Previous recommendation", () => {
+          if (p.id === activePromptId && p.index > 0) goTo(p, p.index - 1);
+        }],
+        ["play", "Play or pause this prompt", () => {
+          togglePromptPlayback(p.id).catch(console.error);
+        }],
+        ["next", "Next recommendation", () => {
+          if (p.id === activePromptId) advanceRecommendation().catch(console.error);
+        }],
+        ["stop", "Stop this prompt's playback", () => {
+          if (p.id === activePromptId) stopPlayback();
+        }]
+      ]) {
+        const control = actionIcon(name, tooltip, handler);
+        control.dataset.playbackControl = name;
+        control.dataset.promptId = String(p.id);
+        playback.append(control);
+      }
+    }
+    const deletion = actionIcon("trash", "Delete prompt and its recommendation history", () => {
       pendingDeletePromptId = p.id;
       renderPromptList();
     });
-    foot.append(progress, deletion);
-    card.append(head, textarea, foot);
+    deletion.classList.add("delete-button");
+    actionRow.append(playback, deletion);
+    card.append(head, textarea, results, actionRow);
     if (pendingDeletePromptId === p.id) {
       const confirmation = document.createElement("div");
       confirmation.className = "delete-confirmation";
@@ -637,6 +702,28 @@ function renderPromptList() {
     });
     promptList.append(card);
   });
+  updateCardPlaybackButtons();
+}
+function updateCardPlaybackButtons() {
+  for (const button of promptList.querySelectorAll("[data-playback-control]")) {
+    const p = promptSessions.find(x => x.id === Number(button.dataset.promptId));
+    const selected = !!p && p.id === activePromptId;
+    const canNavigate = selected && p.explored && !aiLoading;
+    const role = button.dataset.playbackControl;
+    if (role === "previous") button.disabled = !canNavigate || p.index <= 0;
+    if (role === "next") button.disabled = !canNavigate || reachedSessionEnd ||
+      (p.index >= p.recommendations.length - 1 && !autoAdvance);
+    if (role === "stop") button.disabled = !selected || (stopped && !aiLoading);
+    if (role === "play") {
+      button.disabled = !p?.explored || aiLoading;
+      const currentlyPlaying = selected && !stopped && !playbackPaused;
+      button.innerHTML = svgIcon(currentlyPlaying ? "pause" : "play");
+      const tooltip = currentlyPlaying ? "Pause playback" : "Play this prompt";
+      button.title = tooltip;
+      button.setAttribute("aria-label", tooltip);
+      button.setAttribute("aria-pressed", String(currentlyPlaying));
+    }
+  }
 }
 function updateButtons() {
   const p = activeSession();
@@ -645,6 +732,7 @@ function updateButtons() {
   nextButton.disabled = !active || aiLoading || reachedSessionEnd ||
     (p.index >= p.recommendations.length - 1 && !autoAdvance);
   stopButton.disabled = stopped && !aiLoading;
+  updateCardPlaybackButtons();
 }
 function updateDisplay() {
   const p = activeSession();
@@ -652,8 +740,54 @@ function updateDisplay() {
   activePromptText.hidden = !p;
   if (p) activePromptText.textContent = p.text;
   renderPlayerRecommendations();
-  updateButtons();
   renderPromptList();
+  updateButtons();
+}
+function stopPlayback() {
+  newRequest(); stopped = true; aiLoading = false; playbackPaused = false;
+  loadingPromptId = null;
+  spotifyActivationFromStart = null;
+  stopAudio();
+  statusText.textContent = "Stopped. Each prompt's recommendation history remains available.";
+  updateDisplay();
+}
+async function togglePromptPlayback(promptId) {
+  const p = promptSessions.find(x => x.id === promptId);
+  if (!p?.explored || aiLoading) return;
+  if (activePromptId !== promptId || stopped || reachedSessionEnd) {
+    await selectPrompt(promptId);
+    return;
+  }
+  const current = p.recommendations[p.index]?.recording;
+  // Pause/resume the actual embedded recording. Searches in progress are
+  // canceled with Stop rather than claiming an unstarted video was paused.
+  if (!playbackPaused) {
+    if (current?.platform === "youtube" && pendingYouTube && youtubeReady) {
+      youtubePlayer.pauseVideo();
+    } else if (current?.platform === "spotify" && spotifyPlayer) {
+      await spotifyPlayer.pause();
+      setSpotifyPlaybackStatus(false);
+    } else {
+      stopPlayback();
+      return;
+    }
+    playbackPaused = true;
+    statusText.textContent = "Paused. Press Play to resume.";
+  } else {
+    if (current?.platform === "youtube" && pendingYouTube && youtubeReady) {
+      youtubePlayer.playVideo();
+    } else if (current?.platform === "spotify" && spotifyPlayer) {
+      try { spotifyPlayer.activateElement(); } catch (_) {}
+      await spotifyPlayer.resume();
+      setSpotifyPlaybackStatus(true);
+    } else {
+      await goTo(p, p.index);
+      return;
+    }
+    playbackPaused = false;
+    statusText.textContent = "Resuming playback...";
+  }
+  updateButtons();
 }
 function stopYouTube() {
   youtubePlaceholder.hidden = false;
@@ -716,14 +850,19 @@ window.onYouTubeIframeAPIReady = function () {
         youtubeReady = true;
         youtubePlayer.getIframe().setAttribute("allow",
           "autoplay; encrypted-media; fullscreen; picture-in-picture");
-        if (pendingYouTube) playYouTube(pendingYouTube);
+        if (pendingYouTube && !playbackPaused) playYouTube(pendingYouTube);
       },
       onStateChange(event) {
         if (stopped || !pendingYouTube || youtubePlaybackId !== requestNumber) return;
         if (event.data === YT.PlayerState.PLAYING) {
+          playbackPaused = false;
           youtubeFallback.hidden = true;
           markCurrentPlayed("youtube", pendingYouTube.id);
           statusText.textContent = "Playing on YouTube.";
+          updateButtons();
+        } else if (event.data === YT.PlayerState.PAUSED) {
+          playbackPaused = true;
+          updateButtons();
         } else if (event.data === YT.PlayerState.ENDED) {
           advanceWhenEnded(youtubePlaybackId).catch(console.error);
         }
@@ -737,6 +876,8 @@ window.onYouTubeIframeAPIReady = function () {
         if (!recording || recording.platform !== "youtube" ||
             recording.id !== pendingYouTube.id) return;
         youtubeFallback.hidden = false;
+        playbackPaused = true;
+        updateButtons();
         youtubePlaceholder.hidden = true;
         watchOnYouTube.href = "https://www.youtube.com/watch?v=" + encodeURIComponent(recording.id);
         statusText.textContent = "YouTube playback unavailable in this player (error " +
@@ -953,13 +1094,18 @@ function handleSpotifyState(state) {
   }
   const currentUri = state.track_window?.current_track?.uri;
   if (currentUri === uri) {
+    const manuallyPaused = playbackPaused;
     setSpotifyPlaybackStatus(!state.paused);
+    if (playbackPaused !== !!state.paused) {
+      playbackPaused = !!state.paused;
+      updateButtons();
+    }
     if (!state.paused) markCurrentPlayed("spotify", uri);
     const duration = Number(state.duration) || 0;
     const position = Number(state.position) || 0;
     if (!state.paused && duration > 0 && position >= duration - 4000)
       spotifyObservedNearEnd = true;
-    if (state.paused && duration > 0 && spotifyObservedTrackId === uri &&
+    if (state.paused && !manuallyPaused && duration > 0 && spotifyObservedTrackId === uri &&
         (position >= duration - 1000 || (spotifyObservedNearEnd && position <= 1000)))
       advanceWhenEnded(spotifyPlaybackId).catch(console.error);
     spotifyObservedTrackId = uri;
@@ -1086,6 +1232,7 @@ async function goTo(session, index) {
       index < 0 || index >= session.recommendations.length) return;
   const id = newRequest();
   stopped = false;
+  playbackPaused = false;
   reachedSessionEnd = false;
   playbackEnding = false;
   const signal = currentController.signal;
@@ -1285,14 +1432,7 @@ async function advanceWhenEnded(expectedId) {
   finally { playbackEnding = false; }
 }
 nextButton.addEventListener("click", () => { advanceRecommendation().catch(console.error); });
-stopButton.addEventListener("click", () => {
-  newRequest(); stopped = true; aiLoading = false;
-  loadingPromptId = null;
-  spotifyActivationFromStart = null;
-  stopAudio();
-  statusText.textContent = "Stopped. Each prompt's recommendation history remains available.";
-  updateDisplay();
-});
+stopButton.addEventListener("click", stopPlayback);
 $("addPrompt").addEventListener("click", () => {
   const p = addPrompt();
   $("prompt-" + p.id)?.focus();
