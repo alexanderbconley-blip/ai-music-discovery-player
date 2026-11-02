@@ -146,6 +146,9 @@
   <label for="workerUrl">Cloudflare AI Worker URL</label>
   <input id="workerUrl" type="url" placeholder="https://your-worker.your-account.workers.dev/" autocomplete="off">
   <p class="hint">The Worker URL is not an API secret. Do not enter an OpenAI API key here. This page sends a prompt to your Worker only when you click Explore for an unsearched prompt.</p>
+  <label for="workerAccessKey">Private Cloudflare Worker Access Key</label>
+  <input id="workerAccessKey" type="password" placeholder="Enter your PLAYER_ACCESS_KEY secret value" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="workerAccessKeyHelp">
+  <p id="workerAccessKeyHelp" class="hint">Enter the private value you created for PLAYER_ACCESS_KEY in Cloudflare, not the words PLAYER_ACCESS_KEY. The key is sent only to your Cloudflare Worker when requesting new AI recommendations. It is not saved in browser history, exports, or GitHub. Reenter it if you reload the page or return from Spotify sign-in.</p>
   <label for="apiKey">YouTube API Key</label>
   <input id="apiKey" type="password" autocomplete="off" placeholder="Your restricted YouTube Data API key">
   <p class="hint">Your YouTube key is sent to Google for searches; it isn't saved in this player's history. Each YouTube search uses API quota.</p>
@@ -192,7 +195,7 @@
   <div id="youtubePlaceholder" role="status">No YouTube video playing</div>
 </div>
 <p id="status" aria-live="polite"></p>
-<p class="hint">AI generates each prompt's recommendation list once. Selecting a recommendation searches only for that recording. When a recording finishes, the player advances to the next recommendation or the next unexplored prompt. Previous, Next, and Stop also work manually. A gray checkmark means playback has started previously.</p>
+<p class="hint">AI generates each prompt's recommendation list once. Selecting a recommendation searches for that recording when first reached, or replays a previously found recording without searching again. When a recording finishes, the player advances to the next recommendation or the next unexplored prompt. Previous, Next, and Stop also work manually. A gray checkmark means playback has started previously.</p>
 
 <script>
 "use strict";
@@ -203,6 +206,7 @@ const promptList = $("promptList");
 const activePromptText = $("activePromptText");
 const activePromptLabel = $("activePromptLabel");
 const workerUrlInput = $("workerUrl");
+const workerAccessKeyInput = $("workerAccessKey");
 const apiKeyInput = $("apiKey");
 const spotifyStatus = $("spotifyStatus");
 const statusText = $("status");
@@ -533,9 +537,7 @@ function renderPromptList() {
       confirmation.setAttribute("role", "alertdialog");
       confirmation.setAttribute("aria-label", "Confirm prompt deletion");
       const message = document.createElement("p");
-      message.textContent = p.explored
-        ? "Delete this prompt? Its recommendations and playback history will also be permanently deleted."
-        : "Delete this prompt? This cannot be undone.";
+      message.textContent = "Delete this prompt? Deleting this prompt will also permanently delete any AI-generated recommendations and associated playback history. This action cannot be undone.";
       const actions = document.createElement("div");
       actions.className = "delete-confirmation-actions";
       const cancel = document.createElement("button");
@@ -548,7 +550,7 @@ function renderPromptList() {
       confirmDelete.className = "confirm-delete";
       confirmDelete.addEventListener("click", () => {
         pendingDeletePromptId = null;
-        if (activePromptId === p.id) {
+        if (activePromptId === p.id || loadingPromptId === p.id) {
           newRequest(); stopped = true; aiLoading = false;
           loadingPromptId = null; activePromptId = null;
           stopAudio();
@@ -556,9 +558,13 @@ function renderPromptList() {
         }
         promptSessions = promptSessions.filter(x => x.id !== p.id);
         openPromptLists.delete(p.id);
-        if (!promptSessions.length) addPrompt("", false);
+        // Always keep one ready-to-edit card, but never keep the deleted
+        // prompt's text, recommendations, or playback history.
+        const freshPrompt = promptSessions.length ? null : addPrompt("", false);
+        if (freshPrompt) statusText.textContent = "Prompt deleted. A new blank prompt is ready.";
         reachedSessionEnd = false;
         saveHistory(); renderPromptList(); updateDisplay();
+        if (freshPrompt) $("prompt-" + freshPrompt.id)?.focus();
       });
       actions.append(cancel, confirmDelete);
       confirmation.append(message, actions);
@@ -1106,6 +1112,11 @@ async function generateRecommendations(p) {
     statusText.textContent = "Enter your secured Cloudflare Worker URL in Connection setup first.";
     return;
   }
+  const workerAccessKey = workerAccessKeyInput.value.trim();
+  if (!workerAccessKey) {
+    statusText.textContent = "Enter your private Cloudflare Worker access key in Connection setup first.";
+    return;
+  }
   let url;
   try {
     url = new URL(workerUrl);
@@ -1136,7 +1147,7 @@ async function generateRecommendations(p) {
   try {
     const response = await fetch(url.href, {
       method: "POST", signal: currentController.signal,
-      headers: {"Content-Type": "application/json"},
+      headers: {"Content-Type": "application/json", "X-Player-Key": workerAccessKey},
       body: JSON.stringify({prompt})
     });
     if (!response.ok) {
@@ -1210,7 +1221,7 @@ $("addPrompt").addEventListener("click", () => {
 workerUrlInput.addEventListener("input", () => {
   sessionStorage.setItem("ai_music_worker", workerUrlInput.value);
 });
-// Import/export backups contain only discovery history, never API keys or tokens.
+// Import/export backups contain only discovery history, never API keys, Worker access keys, or tokens.
 function sanitizeHistorySessions(raw) {
   if (!Array.isArray(raw) || raw.length > 300) throw new Error("Invalid prompt list or too many prompts.");
   const used = new Set();
