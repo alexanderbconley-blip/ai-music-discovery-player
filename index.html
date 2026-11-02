@@ -1162,7 +1162,7 @@ async function prepareSpotifyPlayer() {
 async function searchSpotify(item, signal) {
   const token = await spotifyToken();
   const params = new URLSearchParams({
-    q: item.title + " " + item.artist, type: "track", limit: "20"
+    q: item.title + " " + item.artist, type: "track", limit: "10"
   });
   const response = await spotifyRequest("search?" + params, token, {signal});
   const data = await response.json();
