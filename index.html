@@ -239,7 +239,7 @@
   </div>
 </div>
 <p id="status" aria-live="polite"></p>
-<p class="hint">Explore initially generates recommendations and attempts to start the first song automatically. Clicking Explore again adds new, nonduplicate songs to the same prompt without removing its history or interrupting playback. Once all previous songs have finished and the player is idle, Explore again also attempts to play the first new song automatically. Your browser may occasionally require you to press Play. Selecting a recommendation searches for that recording when first reached, or replays a previously found recording without searching again. When a recording finishes, the player advances to the next recommendation or the next unexplored prompt. Previous, Next, and Stop also work manually. A gray checkmark means playback started here or you opened the recording directly on YouTube to listen.</p>
+<p class="hint">Explore initially generates recommendations and attempts to start the first song automatically. Clicking Explore again adds new, nonduplicate songs to the same prompt without removing its history or interrupting playback. Once all previous songs have finished and the player is idle, Explore again also attempts to play the first new song automatically. Your browser may occasionally require you to press Play. Selecting a recommendation searches for that recording when first reached, or replays a previously found recording without searching again. When a matching recording cannot be found, the player automatically skips to the next song without marking the unavailable one as played. When a recording finishes, the player advances to the next recommendation or the next unexplored prompt. Previous, Next, and Stop also work manually. A gray checkmark means playback started here or you opened the recording directly on YouTube to listen.</p>
 
 <script>
 "use strict";
@@ -1334,6 +1334,20 @@ function cleanRecommendations(payload) {
     });
 }
 
+// A definitively unmatched song should never halt an automatic listening run.
+// Keep the recommendation in history but do not mark it as played. A short
+// delay lets the user see why it was skipped; Stop/selection cancels the skip.
+function skipUnmatchedRecommendation(session, item, requestId) {
+  if (!isCurrent(requestId)) return;
+  statusText.textContent = (item.message || "No matching recording found.") +
+    " Skipping to the next recommendation...";
+  window.setTimeout(() => {
+    if (!isCurrent(requestId) || activePromptId !== session.id ||
+        session.recommendations[session.index] !== item) return;
+    advanceRecommendation().catch(error => console.error("Auto-skip error:", error));
+  }, 350);
+}
+
 // The recommendation index belongs to its prompt. Nothing is preloaded.
 async function goTo(session, index) {
   if (!session || activePromptId !== session.id ||
@@ -1351,7 +1365,7 @@ async function goTo(session, index) {
   const item = session.recommendations[index];
 
   if (item.checked && !item.recording && item.matchingVersion === MATCHING_VERSION) {
-    statusText.textContent = item.message || "No matching recording found.";
+    skipUnmatchedRecommendation(session, item, id);
     return;
   }
   // Start Spotify activation on the actual user click when possible.
@@ -1404,7 +1418,7 @@ async function goTo(session, index) {
       item.matchingVersion = MATCHING_VERSION;
       item.message = "No matching recording found on connected platforms.";
       saveHistory();
-      statusText.textContent = item.message;
+      skipUnmatchedRecommendation(session, item, id);
       return;
     }
     item.recording = recording;
